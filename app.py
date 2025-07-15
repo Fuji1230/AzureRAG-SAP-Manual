@@ -127,26 +127,21 @@ PIR, 購買情報マスタ
 """
 
 # Function to generate embeddings for title and content fields, also used for query embeddings
-def generate_embeddings(text, text_limit=7000, compress_to_1024=False):
+def generate_embeddings(text, text_limit=7000):
+    # Clean up text (e.g. line breaks, )
     text = re.sub(r'\s+', ' ', text).strip()
     text = re.sub(r'[\n\r]+', ' ', text).strip()
+    # Truncate text if necessary
     if len(text) > text_limit:
         logging.warning("Token limit exceeded maximum length, truncating...")
         text = text[:text_limit]
 
     response = client.embeddings.create(model=AZURE_OPENAI_EMBED_MODEL, input=text)
-    embedding = response.data[0].embedding
-
-    if compress_to_1024:
-        if len(embedding) == 3072:
-            embedding = np.array(embedding).reshape(3, 1024).mean(axis=0).tolist()
-        else:
-            raise ValueError(f"Cannot compress vector of length {len(embedding)} to 1024")
-
-    return embedding
+    embeddings = response.data[0].embedding
+    return embeddings
 
 def query_vector_index(index_name, query, searchtype, top_k_parameter):
-    vector = generate_embeddings(query, compress_to_1024=False)
+    vector = generate_embeddings(query)
     search_client = SearchClient(AI_SEARCH_ENDPOINT, index_name, AzureKeyCredential(AI_SEARCH_KEY))
     vector_query = VectorizedQuery(vector=vector, fields="contentVector")
     # searchtypeがvector_onlyの場合は、search_textをNoneにする
@@ -165,7 +160,7 @@ def query_vector_index(index_name, query, searchtype, top_k_parameter):
                                        query_type='semantic', semantic_configuration_name=AI_SEACH_SEMANTIC)
 
     return results
-
+    
 # chat履歴を Cosmos DB に保存する
 def add_to_cosmos(item):
     container.upsert_item(item)
@@ -176,61 +171,6 @@ def add_feedback_to_cosmos(item):
 def randomname(n):
     randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
     return ''.join(randlst)
-
-def query_image_index(query, top_k=3):
-    vector = generate_embeddings(query, compress_to_1024=True)  # ← 圧縮ON！
-
-    image_search_endpoint = os.getenv("AI_SEARCH_IMAGE_ENDPOINT")
-    image_search_key = os.getenv("AI_SEARCH_IMAGE_KEY")
-    image_index_name = os.getenv("AI_SEARCH_IMAGE_INDEX_NAME")
-
-    if not all([image_search_endpoint, image_search_key, image_index_name]):
-        raise ValueError("画像用AI Searchの環境変数が正しく設定されていません。")
-
-    search_client = SearchClient(
-        endpoint=image_search_endpoint,
-        index_name=image_index_name,
-        credential=AzureKeyCredential(image_search_key)
-    )
-
-    vector_query = VectorizedQuery(vector=vector, fields="content_embedding")  # ← 画像用のフィールド
-    try:
-        results = search_client.search(
-            search_text=None,
-            vector_queries=[vector_query],
-            top=top_k
-        )
-        return [r["content_path"] for r in results]
-    except HttpResponseError as e:
-        print("HTTP Response Error!")
-        print(f"Status Code: {e.status_code}")
-        print(f"Message: {e.message}")
-        print(f"Details: {e.response.text}")
-        raise
-    
-
-def get_image_from_image_blob(image_path: str) -> str:
-    """
-    BLOBストレージ上の画像ファイルを一時ファイルに保存し、そのパスを返す。
-    image_pathは、相対パス（コンテナ内）か、完全なURLどちらも対応。
-    """
-    if not image_path:
-        raise ValueError("image_path is empty. Check AI Search index content.")
-
-    # フルURLの場合
-    if image_path.startswith("http"):
-        blob_client = BlobClient.from_blob_url(blob_url=image_path)
-    else:
-        # 相対パスの場合：事前に取得した image_blob_container_client を使う
-        blob_client = image_blob_container_client.get_blob_client(blob=image_path)
-
-    # 一時ファイルへ保存
-    suffix = os.path.splitext(image_path)[1] or ".jpg"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        blob_stream = blob_client.download_blob()
-        blob_stream.readinto(tmp)
-        return tmp.name
-
 
 def upload_file_to_blob_storage(uploaded_file):
     blob_client = blob_container_client.get_blob_client(uploaded_file.name)
@@ -272,29 +212,6 @@ def get_indexed_filenames(index_name):
     docs = response.json().get("value", [])
     return [doc.get("fileName", "NoName") for doc in docs]
 
-def display_filenames_in_sidebar(filenames):
-    st.sidebar.markdown("### 📄 回答可能なファイル")
-
-    st.sidebar.markdown("""
-        <style>
-        .sidebar-scroll {
-            max-height: 200px;
-            overflow-y: auto;
-            padding: 0.5rem;
-            font-size: 0.85rem;
-            background-color: var(--secondary-background-color);
-            border: 1px solid var(--secondary-background-color);
-            border-radius: 5px;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    html = "<div class='sidebar-scroll'>"
-    for i, name in enumerate(filenames, 1):
-        html += f"{i}. 📄 {name}<br>"
-    html += "</div>"
-
-    st.sidebar.markdown(html, unsafe_allow_html=True)
 
 def main():
     if "feedback_status" not in st.session_state or not isinstance(st.session_state["feedback_status"], dict):
@@ -316,50 +233,6 @@ def main():
 
     # Display explanation in sidebar
     st.sidebar.header("Kuraray G-SAPマニュアル Q&Aアプリ")
-    st.sidebar.markdown("OneNoteに記載されたマニュアルを検索できます。")
-    
-    centered_html = """
-        <style>
-        .center-container {
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            height: 70vh;
-            text-align: center;
-        }
-        .center-container p {
-            font-size: 20px;
-            margin-bottom: 20px;
-        }
-        .center-container a {
-            font-size: 18px;
-            color: #1f77b4;
-            text-decoration: none;
-            margin: 5px 0;
-        }
-        .center-container a:hover {
-            text-decoration: underline;
-        }
-        </style>
-
-        <div class="center-container">
-            <p>詳細は下記のリンク先から確認してください。以下のリンク先の情報を参考に回答しています。</p>
-            <a href="https://kurarayglobal.sharepoint.com/:x:/s/krspp3/Eez5lJ1HHgBBgxy1h1s3K2IBz5gxagHng3kBNjeuK8qmSw" target="_blank">▶ QA集リスト</a>
-            <a href="https://kurarayglobal.sharepoint.com/sites/krspp3/Business%20manual/Wave3%20JAPAN/07_Cross/QA%E9%9B%86!!%E7%B7%A8%E9%9B%86%E4%B8%8D%E5%8F%AF!!?d=w68ebcaa560ec4df396b00af9eae23c6d" target="_blank">▶ QA集</a>
-            <a href="https://kurarayglobal.sharepoint.com/:f:/s/krspp3/EkJspieiifVGvz60d9oIJlYBHzpPKwSe8HZz_RO3mIri7A" target="_blank">▶ 業務マニュアル</a>
-        </div>
-        """
-
-    # HTMLを埋め込む
-    st.markdown(centered_html, unsafe_allow_html=True)
-     # --- インデックス内のファイル名を表示（スクロール対応） ---
-    #try:
-        #filenames = get_indexed_filenames(indexname)
-        #display_filenames_in_sidebar(filenames)
-    #except Exception as e:
-        #st.sidebar.error("ファイル名の取得に失敗しました。")
-        #st.sidebar.exception(e)
 
     # セッションIDの初期化
     if "session_id" not in st.session_state:
@@ -500,17 +373,6 @@ def main():
                             displayed_files.append(filename[i])  # ファイル名を追跡リストに追加
             else:
                 pass
-        related_images = query_image_index(user_input)
-
-        if related_images:
-            st.markdown("### 📷 関連画像:")
-            cols = st.columns(len(related_images))
-
-            for idx, image_path in enumerate(related_images):
-                local_image_path = get_image_from_image_blob(image_path)
-                cols[idx].image(local_image_path, caption=os.path.basename(image_path))
-        else:
-            st.markdown("関連する画像は見つかりませんでした。")
 
         # idにはランダム値を挿入する
         id1 = randomname(20)
