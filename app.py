@@ -120,28 +120,33 @@ PIR, 購買情報マスタ
 ・以下のSources(情報源)を使用しない回答は生成しないでください 。回答には役割(userやassistantなど)の情報を含めないでください。
 ・ユーザーの質問が不明瞭な場合は、明確化のためにユーザに必ず質問してください。
 ・Sourcesには、名前の後にコロンと実際の情報が続きます。回答で使用する各事実について、常にSourcesの情報を含めてください。
-  情報源を参照するには、各Content情報の前段にあるfilenameの情報を反映してください。角かっこを使用してください。
-  Sources参照ルール：[filename] 　Sources出力例：[info1.txt]
-・Sourcesを組み合わせないでください。各Sourcesを個別にリストしてください。例：[info1.txt],[info1.txt]
+  情報源を参照するには、各Content情報の後段にあるPageName, NoteName, SectionName, webURLの情報を反映してください。角かっこを使用してください。
+  Sources参照ルール：[webURL] の形式で出典を明示してください。
+・Sourcesを組み合わせないでください。各Sourcesを個別にリストしてください。
 ・日本語の質問の場合は、日本語で回答を作成してください。英語での質問の場合は、英語で回答を作成し回答してください。    
 """
 
 # Function to generate embeddings for title and content fields, also used for query embeddings
-def generate_embeddings(text, text_limit=7000):
-    # Clean up text (e.g. line breaks, )
+def generate_embeddings(text, text_limit=7000, compress_to_1024=False):
     text = re.sub(r'\s+', ' ', text).strip()
     text = re.sub(r'[\n\r]+', ' ', text).strip()
-    # Truncate text if necessary
     if len(text) > text_limit:
         logging.warning("Token limit exceeded maximum length, truncating...")
         text = text[:text_limit]
 
     response = client.embeddings.create(model=AZURE_OPENAI_EMBED_MODEL, input=text)
-    embeddings = response.data[0].embedding
-    return embeddings
+    embedding = response.data[0].embedding
+
+    if compress_to_1024:
+        if len(embedding) == 3072:
+            embedding = np.array(embedding).reshape(3, 1024).mean(axis=0).tolist()
+        else:
+            raise ValueError(f"Cannot compress vector of length {len(embedding)} to 1024")
+
+    return embedding
 
 def query_vector_index(index_name, query, searchtype, top_k_parameter):
-    vector = generate_embeddings(query)
+    vector = generate_embeddings(query, compress_to_1024=False)
     search_client = SearchClient(AI_SEARCH_ENDPOINT, index_name, AzureKeyCredential(AI_SEARCH_KEY))
     vector_query = VectorizedQuery(vector=vector, fields="contentVector")
     # searchtypeがvector_onlyの場合は、search_textをNoneにする
@@ -160,7 +165,7 @@ def query_vector_index(index_name, query, searchtype, top_k_parameter):
                                        query_type='semantic', semantic_configuration_name=AI_SEACH_SEMANTIC)
 
     return results
-    
+
 # chat履歴を Cosmos DB に保存する
 def add_to_cosmos(item):
     container.upsert_item(item)
@@ -171,6 +176,7 @@ def add_feedback_to_cosmos(item):
 def randomname(n):
     randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
     return ''.join(randlst)
+
 
 def upload_file_to_blob_storage(uploaded_file):
     blob_client = blob_container_client.get_blob_client(uploaded_file.name)
@@ -211,6 +217,7 @@ def get_indexed_filenames(index_name):
 
     docs = response.json().get("value", [])
     return [doc.get("fileName", "NoName") for doc in docs]
+
 
 
 def main():
@@ -317,14 +324,30 @@ def main():
             content = result['content']
             title = result['title']
             Keywords = result['keywords']
+            NoteName = result['NoteName']
+            SectionName = result['SectionName']
+            PageName = result['PageName']
+            webURL = result['webURL']
+
 
             # 変数prompt_sourceに各変数の値を追加する
-            prompt_source += f"## filename: {filename}\n\n  ### score: {Score}\n\n  ### content: \n\n {content}\n\n"
-
+            prompt_source += (
+                f"## source: {webURL}\n\n"
+                f"### PageName: {PageName}\n"
+                f"### NoteName: {NoteName}\n"
+                f"### SectionName: {SectionName}\n"
+                f"### content:\n\n{content}\n\n"
+            )
             # filename, title, contentの内容をmarkdown形式でsourcetemp配列に格納する
             # sourcetempはresultの内容が変わる度に配列を変更する
-            sourcetemp.append(f"## filename: {filename}\n\n  ### title: {title}\n\n  ### content: \n\n {content}\n\n")
-
+            sourcetemp.append({
+                "webURL": webURL,
+                "PageName": PageName,
+                "NoteName": NoteName,
+                "SectionName": SectionName,
+                "title": title,
+                "content": content
+            })
         # プロンプトを作成する
         promptall = SystemRole + "\n\n# Sources(情報源): \n\n" + prompt_source + "# 今までの会話履歴：\n\n" + conversion_history + "# 回答の生成\n\nそれでは、制約を踏まえて最高の回答をしてください。あなたならできる！"
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -364,13 +387,17 @@ def main():
         with st.expander("参照元"):
             displayed_files = []  # 既に表示されたファイル名を追跡するためのリスト
             if "[" in response:
-                filename = re.findall(r'\[(.*?)\]', response)
-                for i in range(len(filename)):
-                    for j in range(len(sourcetemp)):
-                        if filename[i] in sourcetemp[j] and filename[i] not in displayed_files:  # ファイル名が既に表示されていないことを確認
-                            with st.popover(filename[i]):
-                                st.write(sourcetemp[j])
-                            displayed_files.append(filename[i])  # ファイル名を追跡リストに追加
+                urls = re.findall(r'\[(https?://[^\]]+)\]', response)
+                for url in urls:
+                    for item in sourcetemp:
+                        if item["webURL"] == url and url not in displayed_files:
+                            with st.popover(f"参照: {item['PageName']}"):
+                                st.write(f"### Page: {item['PageName']}")
+                                st.write(f"### Section: {item['SectionName']}")
+                                st.write(f"### URL: {item['webURL']}")
+                                st.write("---")
+                                st.write(item['content'])
+                            displayed_files.append(url)
             else:
                 pass
 

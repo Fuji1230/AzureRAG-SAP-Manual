@@ -20,6 +20,7 @@ from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
 from bs4 import BeautifulSoup
+import urllib.parse
 
 # 環境変数を読み込む
 load_dotenv()
@@ -181,6 +182,7 @@ def process_file(file_path, index_name=None, args=None):
 
     print("use_blob_storage:", USE_BLOB_STORAGE)
     download_file_path = file_path
+    metadata = {}
     if USE_BLOB_STORAGE and args.blob:
         blob_client = blob_container_client.get_blob_client(os.path.basename(file_path))
         download_file_path = os.path.join(os.getcwd(), os.path.basename(file_path))
@@ -188,6 +190,7 @@ def process_file(file_path, index_name=None, args=None):
             download_data = blob_client.download_blob()
             download_data.readinto(download_file)
         print(f"Downloaded {file_path} from Blob Storage to {download_file_path}.")
+        metadata = blob_client.get_blob_properties().metadata
 
     ext = os.path.splitext(download_file_path)[1].lower()
     if ext == ".pdf":
@@ -201,6 +204,8 @@ def process_file(file_path, index_name=None, args=None):
         content = extract_text_from_xlsx(download_file_path)
     elif ext == ".pptx":
         content = extract_text_from_pptx(download_file_path)
+    elif ext == ".png":
+        content = get_content_from_document(download_file_path)
     elif ext in [".html", ".htm"]:
         content = extract_text_from_html(download_file_path)
     elif ext == ".json":
@@ -215,6 +220,7 @@ def process_file(file_path, index_name=None, args=None):
         os.remove(download_file_path)
 
     file_name = os.path.basename(file_path)
+    decoded_metadata = {k: urllib.parse.unquote(v) for k, v in metadata.items()}
     index_docs = []
     for chunk_no, chunk in enumerate(chunks):
         print("enrichment chunk:", f"{chunk_no+1}/{len(chunks)}")
@@ -230,6 +236,10 @@ def process_file(file_path, index_name=None, args=None):
             "summary": docinfo['summary'],
             "keywords": docinfo['Keywords'],
             "contentVector": get_vector(docinfo['summary']),
+            "PageName": decoded_metadata.get("PageName", ""),
+            "NoteName": decoded_metadata.get("NoteName", ""),
+            "SectionName": decoded_metadata.get("SectionName", ""),
+            "webURL": metadata.get("webURL", "")
         }
         index_docs.append(index_doc)
         add_to_cosmos(index_doc)
